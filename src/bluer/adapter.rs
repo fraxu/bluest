@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bluer::monitor::{Monitor, MonitorEvent, MonitorManager, Pattern, RssiSamplingPeriod};
 use bluer::AdapterProperty;
 use futures_core::Stream;
 use futures_lite::StreamExt;
@@ -14,6 +15,7 @@ use crate::{AdapterEvent, AdvertisingDevice, ConnectionEvent, Device, DeviceId, 
 pub struct AdapterImpl {
     inner: bluer::Adapter,
     session: Arc<bluer::Session>,
+    monitor: Arc<MonitorManager>,
 }
 
 impl PartialEq for AdapterImpl {
@@ -34,11 +36,13 @@ impl AdapterImpl {
     /// Creates an interface to the default Bluetooth adapter for the system
     pub async fn default() -> Option<Self> {
         let session = Arc::new(bluer::Session::new().await.ok()?);
-        session
-            .default_adapter()
-            .await
-            .ok()
-            .map(|inner| AdapterImpl { inner, session })
+        let adapter = session.default_adapter().await.ok()?;
+
+        adapter.monitor().await.ok().map(|monitor| AdapterImpl {
+            inner: adapter,
+            session,
+            monitor: Arc::new(monitor),
+        })
     }
 
     /// A stream of [`AdapterEvent`] which allows the application to identify when the adapter is enabled or disabled.
@@ -124,15 +128,33 @@ impl AdapterImpl {
         &'a self,
         services: &'a [Uuid],
     ) -> Result<impl Stream<Item = AdvertisingDevice> + Send + Unpin + 'a> {
-        Ok(self
-            .inner
-            .discover_devices()
-            .await?
+        self.inner.set_powered(true).await?;
+        let mut monitor_handle = self
+            .monitor
+            .register(Monitor {
+                monitor_type: bluer::monitor::Type::OrPatterns,
+                rssi_low_threshold: None,
+                rssi_high_threshold: None,
+                rssi_low_timeout: None,
+                rssi_high_timeout: None,
+                rssi_sampling_period: Some(RssiSamplingPeriod::First),
+                patterns: Some(vec![Pattern {
+                    data_type: 0xff,
+                    start_position: 0x00,
+                    // Hard coded for RuuviTag manufacturer ID
+                    content: vec![0x99, 0x04],
+                }]),
+                ..Default::default()
+            })
+            .await?;
+
+        Ok(monitor_handle
             .then(move |event| {
                 Box::pin(async move {
                     match event {
-                        bluer::AdapterEvent::DeviceAdded(addr) => {
-                            let device = Device::new(self.session.clone(), &self.inner, addr).ok()?;
+                        MonitorEvent::DeviceFound(devid) => {
+                            let device_found = self.inner.device(devid.device).ok()?;
+                            let device = Device::new(self.session.clone(), &self.inner, device_found.address()).ok()?;
                             if !device.is_connected().await {
                                 let adv_data = device.0.adv_data().await;
                                 let rssi = device.rssi().await.ok();
